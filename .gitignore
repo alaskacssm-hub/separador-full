@@ -1,0 +1,21 @@
+# Ambiente / segredos
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Banco local antigo (SQLite - não é mais usado, mas por segurança)
+*.db
+*.db-journal
+
+# Arquivos temporários do app (PDFs enviados via /api/import-pdf)
+_tmp_*.pdf
+
+# SO / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
