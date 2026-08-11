@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
-import json, os, re, uuid, asyncio
+import json, os, re, uuid, asyncio, secrets, time
 from datetime import datetime, date
 from pathlib import Path
 import fitz
@@ -44,6 +44,48 @@ class Hub:
         for ws in dead: self.disconnect(ws)
 
 hub=Hub()
+
+# --- Senha do painel administrativo -----------------------------------------
+# Defina ADMIN_PASSWORD (no .env local ou nas variáveis de ambiente do Render)
+# pra exigir login no painel admin. Se não for definida, o painel fica aberto
+# (mesmo comportamento de antes) — assim quem ainda não configurou não fica
+# travado por engano.
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '').strip()
+SESSION_HOURS = 12
+_admin_sessions = {}  # token -> expira_em (timestamp)
+
+def _new_admin_session():
+    token = secrets.token_urlsafe(32)
+    _admin_sessions[token] = time.time() + SESSION_HOURS*3600
+    return token
+
+def _check_admin_session(token):
+    exp = _admin_sessions.get(token)
+    if not exp or exp < time.time():
+        _admin_sessions.pop(token, None)
+        return False
+    return True
+
+async def require_admin(x_admin_token: str|None = Header(default=None)):
+    if not ADMIN_PASSWORD:
+        return  # senha não configurada: painel aberto
+    if not x_admin_token or not _check_admin_session(x_admin_token):
+        raise HTTPException(401, 'Sessão de administrador inválida ou expirada. Faça login novamente.')
+
+class AdminLoginIn(BaseModel): senha: str
+
+@app.post('/api/admin/login')
+def admin_login(body: AdminLoginIn):
+    if not ADMIN_PASSWORD:
+        return {'ok': True, 'token': None, 'protegido': False}  # sem senha configurada
+    if not secrets.compare_digest(body.senha, ADMIN_PASSWORD):
+        raise HTTPException(401, 'Senha incorreta.')
+    return {'ok': True, 'token': _new_admin_session(), 'protegido': True}
+
+@app.get('/api/admin/check')
+def admin_check(x_admin_token: str|None = Header(default=None)):
+    if not ADMIN_PASSWORD: return {'protegido': False, 'autenticado': True}
+    return {'protegido': True, 'autenticado': bool(x_admin_token and _check_admin_session(x_admin_token))}
 
 # Pool de conexões: evita abrir um handshake TCP+TLS novo com o Postgres a cada
 # requisição (o maior custo de latência num banco remoto como o Neon). min_size=0
@@ -505,6 +547,8 @@ async def delete_product(product_id:str):
     fid=p['full_id']
     c.execute('DELETE FROM products WHERE id=%s',(product_id,))  # cascade remove atribuições e itens de caixa deste produto
     c.commit(); c.close(); await changed(fid); return {'ok':True}
+
+@app.post('/api/fulls/{full_id}/assignments')
 async def save_assignment(full_id:str, body:AssignmentIn):
     c=conn();
     p=c.execute('SELECT * FROM products WHERE id=%s AND full_id=%s',(body.product_id,full_id)).fetchone()
