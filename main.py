@@ -210,6 +210,13 @@ class ProgressIn(BaseModel): separado: int=Field(ge=0)
 class StatusIn(BaseModel): status: str; user_id: str|None=None
 class VolumeCreate(BaseModel): created_by: str|None=None
 class VolumeItemIn(BaseModel): product_id: str; quantidade: int=Field(ge=0); modo: str='somar'
+class ProductEdit(BaseModel):
+    nome: str|None = None
+    quantidade: int|None = Field(default=None, ge=0)
+    sku: str|None = None
+    codigo_ml: str|None = None
+    codigo_universal: str|None = None
+    instrucoes: str|None = None
 
 @app.get('/api/health')
 def health(): return {'ok':True}
@@ -388,7 +395,41 @@ async def release_product(product_id:str, user_id:str):
         c.execute("UPDATE fulls SET status='aguardando',updated_at=%s WHERE id=%s",(now(),p['full_id']))
     c.commit(); fid=p['full_id']; c.close(); await changed(fid); return {'ok':True}
 
-@app.post('/api/fulls/{full_id}/assignments')
+@app.put('/api/products/{product_id}')
+async def edit_product(product_id:str, body:ProductEdit):
+    c=conn()
+    p=c.execute('SELECT * FROM products WHERE id=%s',(product_id,)).fetchone()
+    if not p: c.close(); raise HTTPException(404,'Produto não encontrado.')
+    fields={}
+    if body.nome is not None:
+        nome=body.nome.strip()
+        if not nome: c.close(); raise HTTPException(400,'Nome não pode ficar vazio.')
+        fields['nome']=nome
+    if body.sku is not None: fields['sku']=body.sku.strip()
+    if body.codigo_ml is not None: fields['codigo_ml']=body.codigo_ml.strip()
+    if body.codigo_universal is not None: fields['codigo_universal']=body.codigo_universal.strip()
+    if body.instrucoes is not None: fields['instrucoes']=body.instrucoes
+    if body.quantidade is not None:
+        sep_total=c.execute('SELECT COALESCE(SUM(separado),0) n FROM assignments WHERE product_id=%s',(product_id,)).fetchone()['n']
+        boxed_total=c.execute('SELECT COALESCE(SUM(quantidade),0) n FROM volume_items WHERE product_id=%s',(product_id,)).fetchone()['n']
+        minimo=max(sep_total,boxed_total)
+        if body.quantidade<minimo:
+            c.close(); raise HTTPException(400,f'A quantidade não pode ser menor que {minimo} (já separado/em caixas).')
+        fields['quantidade']=body.quantidade
+    if not fields:
+        data=full_summary(c,p['full_id']); c.commit(); c.close(); return data
+    sets=','.join(f'{k}=%s' for k in fields)
+    c.execute(f'UPDATE products SET {sets} WHERE id=%s',(*fields.values(),product_id))
+    c.commit(); fid=p['full_id']; c.close(); await changed(fid); return {'ok':True}
+
+@app.delete('/api/products/{product_id}')
+async def delete_product(product_id:str):
+    c=conn()
+    p=c.execute('SELECT * FROM products WHERE id=%s',(product_id,)).fetchone()
+    if not p: c.close(); raise HTTPException(404,'Produto não encontrado.')
+    fid=p['full_id']
+    c.execute('DELETE FROM products WHERE id=%s',(product_id,))  # cascade remove atribuições e itens de caixa deste produto
+    c.commit(); c.close(); await changed(fid); return {'ok':True}
 async def save_assignment(full_id:str, body:AssignmentIn):
     c=conn();
     p=c.execute('SELECT * FROM products WHERE id=%s AND full_id=%s',(body.product_id,full_id)).fetchone()
