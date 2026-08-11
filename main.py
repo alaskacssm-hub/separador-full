@@ -231,7 +231,13 @@ async def import_pdf(file: UploadFile=File(...)):
     finally:
         try: tmp.unlink()
         except: pass
-    return {'filename':file.filename,'parsed':parsed}
+    existing=None
+    if parsed.get('frete_ml'):
+        c=conn()
+        f=c.execute('SELECT * FROM fulls WHERE frete_ml=%s ORDER BY created_at DESC LIMIT 1',(parsed['frete_ml'],)).fetchone()
+        if f: existing=full_summary(c,f['id'])
+        c.close()
+    return {'filename':file.filename,'parsed':parsed,'existing':existing}
 
 @app.post('/api/fulls')
 async def create_full(body:FullCreate):
@@ -245,6 +251,46 @@ async def create_full(body:FullCreate):
     c.execute('INSERT INTO status_history VALUES (%s,%s,%s,%s,%s)',(uid('hist_'),fid,'aguardando',None,t))
     c.commit(); data=full_summary(c,fid); c.close(); await hub.broadcast({'type':'full_created','full_id':fid})
     return data
+
+@app.put('/api/fulls/{full_id}/import-update')
+async def import_update_full(full_id:str, body:FullCreate):
+    c=conn()
+    f=c.execute('SELECT * FROM fulls WHERE id=%s',(full_id,)).fetchone()
+    if not f: c.close(); raise HTTPException(404,'Envio não encontrado.')
+    existing=c.execute('SELECT * FROM products WHERE full_id=%s',(full_id,)).fetchall()
+    def key(p_dict):
+        cm=(p_dict.get('codigo_ml') or '').strip()
+        if cm: return ('cm',cm)
+        sk=(p_dict.get('sku') or '').strip()
+        if sk: return ('sk',sk)
+        return ('nm',(p_dict.get('nome') or '').strip().lower())
+    existing_by_key={key(dict(e)):e for e in existing}
+    matched_ids=set(); atualizados=[]; adicionados=[]; avisos=[]; t=now()
+    for p in body.products:
+        q=int(p.get('quantidade') or 0)
+        if q<0: raise HTTPException(400,'Quantidade inválida.')
+        k=key(p); ex=existing_by_key.get(k)
+        if ex:
+            matched_ids.add(ex['id'])
+            sep_total=c.execute('SELECT COALESCE(SUM(separado),0) n FROM assignments WHERE product_id=%s',(ex['id'],)).fetchone()['n']
+            boxed_total=c.execute('SELECT COALESCE(SUM(quantidade),0) n FROM volume_items WHERE product_id=%s',(ex['id'],)).fetchone()['n']
+            minimo=max(sep_total,boxed_total)
+            novo_nome=p.get('nome') or ex['nome']
+            novo_q=q
+            if q<minimo:
+                novo_q=ex['quantidade']
+                avisos.append(f"{ex['nome']}: quantidade do PDF ({q}) é menor que o já separado/em caixas ({minimo}); mantida em {ex['quantidade']}.")
+            if novo_nome!=ex['nome'] or novo_q!=ex['quantidade']:
+                c.execute('UPDATE products SET nome=%s,quantidade=%s,codigo_universal=%s,instrucoes=%s WHERE id=%s',(novo_nome,novo_q,p.get('codigo_universal',ex['codigo_universal']),p.get('instrucoes',ex['instrucoes']),ex['id']))
+                atualizados.append({'nome':novo_nome,'quantidade_antes':ex['quantidade'],'quantidade_depois':novo_q})
+        else:
+            c.execute('INSERT INTO products (id,full_id,codigo_ml,codigo_universal,sku,nome,quantidade,separado,instrucoes,created_at,claimed_by,claimed_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(uid('prod_'),full_id,p.get('codigo_ml',''),p.get('codigo_universal',''),p.get('sku',''),p.get('nome','Produto'),q,0,p.get('instrucoes',''),t,None,None))
+            adicionados.append({'nome':p.get('nome','Produto'),'quantidade':q})
+    nao_encontrados=[dict(e)['nome'] for e in existing if e['id'] not in matched_ids]
+    c.execute('UPDATE fulls SET nome=%s,previsao_data=%s,frete_ml=%s,source_filename=%s,updated_at=%s WHERE id=%s',(body.nome,body.previsao_data,body.frete_ml,body.source_filename,t,full_id))
+    c.commit(); data=full_summary(c,full_id); c.close()
+    await hub.broadcast({'type':'full_updated','full_id':full_id,'data':data})
+    return {**data,'relatorio':{'atualizados':atualizados,'adicionados':adicionados,'nao_encontrados_no_novo_arquivo':nao_encontrados,'avisos':avisos}}
 
 @app.get('/api/fulls')
 def list_fulls():
