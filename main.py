@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
-import json, os, re, uuid, asyncio, secrets, time
+import json, os, re, uuid, asyncio, secrets, time, hashlib
 from datetime import datetime, date
 from pathlib import Path
 import fitz
@@ -86,6 +86,63 @@ def admin_login(body: AdminLoginIn):
 def admin_check(x_admin_token: str|None = Header(default=None)):
     if not ADMIN_PASSWORD: return {'protegido': False, 'autenticado': True}
     return {'protegido': True, 'autenticado': bool(x_admin_token and _check_admin_session(x_admin_token))}
+
+def _admin_ok(x_admin_token: str|None) -> bool:
+    if not ADMIN_PASSWORD: return True  # painel aberto se não configurado
+    return bool(x_admin_token and _check_admin_session(x_admin_token))
+
+# --- Senha individual de cada colaborador ------------------------------------
+PBKDF2_ROUNDS = 200_000
+
+def hash_password(senha: str, salt: str|None = None):
+    salt = salt or secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac('sha256', senha.encode(), salt.encode(), PBKDF2_ROUNDS).hex()
+    return h, salt
+
+def verify_password(senha: str, salt: str, expected_hash: str) -> bool:
+    h,_ = hash_password(senha, salt)
+    return secrets.compare_digest(h, expected_hash)
+
+SESSION_HOURS_WORKER = 12
+_worker_sessions = {}  # token -> {'user_id':..., 'exp':...}
+
+def _new_worker_session(user_id: str):
+    token = secrets.token_urlsafe(32)
+    _worker_sessions[token] = {'user_id': user_id, 'exp': time.time() + SESSION_HOURS_WORKER*3600}
+    return token
+
+def _worker_session_user(token: str|None):
+    s = _worker_sessions.get(token) if token else None
+    if not s or s['exp'] < time.time():
+        _worker_sessions.pop(token, None)
+        return None
+    return s['user_id']
+
+async def require_worker(x_worker_token: str|None = Header(default=None)) -> str:
+    """Valida a sessão do colaborador e devolve o user_id autenticado."""
+    uid_ = _worker_session_user(x_worker_token)
+    if not uid_: raise HTTPException(401, 'Sessão de colaborador inválida ou expirada. Faça login novamente.')
+    return uid_
+
+async def require_admin_or_worker(x_admin_token: str|None = Header(default=None), x_worker_token: str|None = Header(default=None)):
+    """Para ações compartilhadas (ex.: caixas/volumes), aceita admin OU qualquer colaborador autenticado."""
+    if _admin_ok(x_admin_token): return
+    if _worker_session_user(x_worker_token): return
+    raise HTTPException(401, 'É necessário estar autenticado (admin ou colaborador) para esta ação.')
+
+class WorkerLoginIn(BaseModel): user_id: str; senha: str
+
+@app.post('/api/worker/login')
+def worker_login(body: WorkerLoginIn):
+    c=conn()
+    u=c.execute('SELECT id,nome,senha_hash,senha_salt FROM users WHERE id=%s AND ativo=1',(body.user_id,)).fetchone()
+    c.close()
+    if not u: raise HTTPException(404,'Colaborador não encontrado.')
+    if not u['senha_hash']:
+        raise HTTPException(403,'Este colaborador ainda não tem senha definida. Peça para o administrador cadastrar uma.')
+    if not verify_password(body.senha, u['senha_salt'], u['senha_hash']):
+        raise HTTPException(401,'Senha incorreta.')
+    return {'ok':True,'token':_new_worker_session(u['id']),'user_id':u['id'],'nome':u['nome']}
 
 # Pool de conexões: evita abrir um handshake TCP+TLS novo com o Postgres a cada
 # requisição (o maior custo de latência num banco remoto como o Neon). min_size=0
@@ -172,6 +229,11 @@ def init_db():
     # Migrations for databases created by older versions of this app.
     c.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS claimed_by TEXT')
     c.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS claimed_at TEXT')
+    # Senha individual por colaborador. Colaboradores criados antes desta versão
+    # ficam com senha_hash NULL, ou seja, sem senha definida ainda — o admin
+    # precisa definir uma para cada um antes que eles consigam entrar.
+    c.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS senha_hash TEXT')
+    c.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS senha_salt TEXT')
     c.commit(); c.close()
 init_db()
 
@@ -240,7 +302,7 @@ def full_summary(c, full_id):
     f=c.execute('SELECT * FROM fulls WHERE id=%s',(full_id,)).fetchone()
     if not f: raise HTTPException(404,'FULL não encontrado')
     products=c.execute('SELECT * FROM products WHERE full_id=%s ORDER BY ord',(full_id,)).fetchall()
-    users=c.execute('SELECT * FROM users WHERE ativo=1 ORDER BY nome').fetchall()
+    users=c.execute(f'SELECT {USER_PUBLIC_COLS} FROM users WHERE ativo=1 ORDER BY nome').fetchall()
     shipment_users=c.execute('SELECT su.*,u.nome user_nome FROM shipment_users su JOIN users u ON u.id=su.user_id WHERE su.full_id=%s ORDER BY u.nome',(full_id,)).fetchall()
     assigns=c.execute('SELECT a.*,u.nome user_nome,p.nome product_nome,p.sku,p.codigo_ml FROM assignments a JOIN users u ON u.id=a.user_id JOIN products p ON p.id=a.product_id WHERE a.full_id=%s ORDER BY u.nome,p.nome',(full_id,)).fetchall()
     vols=c.execute('SELECT * FROM volumes WHERE full_id=%s ORDER BY seq',(full_id,)).fetchall()
@@ -273,7 +335,8 @@ class FullCreate(BaseModel):
     source_filename: str=''
     products: list[dict]
 
-class UserCreate(BaseModel): nome: str
+class UserCreate(BaseModel): nome: str; senha: str = Field(min_length=4)
+class PasswordSetIn(BaseModel): senha: str = Field(min_length=4)
 class ShipmentUserIn(BaseModel): user_id: str
 class ClaimIn(BaseModel): user_id: str
 class AssignmentIn(BaseModel): product_id: str; user_id: str; quantidade: int=Field(ge=0)
@@ -293,7 +356,7 @@ class ProductEdit(BaseModel):
 def health(): return {'ok':True}
 
 @app.post('/api/import-pdf')
-async def import_pdf(file: UploadFile=File(...)):
+async def import_pdf(file: UploadFile=File(...), _=Depends(require_admin)):
     if not file.filename.lower().endswith('.pdf'): raise HTTPException(400,'Envie um arquivo PDF.')
     tmp=BASE/('_tmp_'+uid()+'.pdf')
     data=await file.read(); tmp.write_bytes(data)
@@ -311,7 +374,7 @@ async def import_pdf(file: UploadFile=File(...)):
     return {'filename':file.filename,'parsed':parsed,'existing':existing}
 
 @app.post('/api/fulls')
-async def create_full(body:FullCreate):
+async def create_full(body:FullCreate, _=Depends(require_admin)):
     if not body.products: raise HTTPException(400,'Nenhum produto informado.')
     c=conn(); fid=uid('full_'); t=now()
     c.execute('INSERT INTO fulls VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',(fid,body.frete_ml,body.nome,body.previsao_data,'aguardando',t,t,body.source_filename))
@@ -324,7 +387,7 @@ async def create_full(body:FullCreate):
     return data
 
 @app.put('/api/fulls/{full_id}/import-update')
-async def import_update_full(full_id:str, body:FullCreate):
+async def import_update_full(full_id:str, body:FullCreate, _=Depends(require_admin)):
     c=conn()
     f=c.execute('SELECT * FROM fulls WHERE id=%s',(full_id,)).fetchone()
     if not f: c.close(); raise HTTPException(404,'Envio não encontrado.')
@@ -364,18 +427,18 @@ async def import_update_full(full_id:str, body:FullCreate):
     return {**data,'relatorio':{'atualizados':atualizados,'adicionados':adicionados,'nao_encontrados_no_novo_arquivo':nao_encontrados,'avisos':avisos}}
 
 @app.get('/api/fulls')
-def list_fulls():
+def list_fulls(_=Depends(require_admin_or_worker)):
     c=conn(); rows=c.execute('SELECT * FROM fulls ORDER BY COALESCE(previsao_data,\'9999-12-31\'),created_at DESC').fetchall(); out=[]
     for f in rows:
         d=full_summary(c,f['id']); out.append({'full':d['full'],'stats':d['stats']})
     c.close(); return out
 
 @app.get('/api/fulls/{full_id}')
-def get_full(full_id:str):
+def get_full(full_id:str, _=Depends(require_admin_or_worker)):
     c=conn(); d=full_summary(c,full_id); c.commit(); c.close(); return d
 
 @app.delete('/api/fulls/{full_id}')
-async def delete_full(full_id:str):
+async def delete_full(full_id:str, _=Depends(require_admin)):
     c=conn()
     if not c.execute('SELECT 1 FROM fulls WHERE id=%s',(full_id,)).fetchone():
         c.close(); raise HTTPException(404,'FULL não encontrado.')
@@ -384,19 +447,31 @@ async def delete_full(full_id:str):
     await hub.broadcast({'type':'full_deleted','full_id':full_id})
     return {'ok':True}
 
+USER_PUBLIC_COLS = 'id,nome,ativo,created_at,(senha_hash IS NOT NULL) AS tem_senha'
+
 @app.post('/api/users')
-async def create_user(body:UserCreate):
+async def create_user(body:UserCreate, _=Depends(require_admin)):
     name=body.nome.strip()
     if not name: raise HTTPException(400,'Nome obrigatório.')
+    h,salt=hash_password(body.senha)
     c=conn()
     try:
-        c.execute('INSERT INTO users VALUES (%s,%s,%s,%s)',(uid('usr_'),name,1,now())); c.commit()
+        c.execute('INSERT INTO users (id,nome,ativo,created_at,senha_hash,senha_salt) VALUES (%s,%s,%s,%s,%s,%s)',(uid('usr_'),name,1,now(),h,salt)); c.commit()
     except psycopg.errors.UniqueViolation:
         c.rollback(); c.close(); raise HTTPException(409,'Colaborador já cadastrado.')
-    rows=[dict(x) for x in c.execute('SELECT * FROM users WHERE ativo=1 ORDER BY nome')]; c.close(); await hub.broadcast({'type':'users_updated'}); return rows
+    rows=[dict(x) for x in c.execute(f'SELECT {USER_PUBLIC_COLS} FROM users WHERE ativo=1 ORDER BY nome')]; c.close(); await hub.broadcast({'type':'users_updated'}); return rows
+
+@app.put('/api/users/{user_id}/password')
+async def set_user_password(user_id:str, body:PasswordSetIn, _=Depends(require_admin)):
+    c=conn()
+    if not c.execute('SELECT 1 FROM users WHERE id=%s',(user_id,)).fetchone():
+        c.close(); raise HTTPException(404,'Colaborador não encontrado.')
+    h,salt=hash_password(body.senha)
+    c.execute('UPDATE users SET senha_hash=%s,senha_salt=%s WHERE id=%s',(h,salt,user_id))
+    c.commit(); c.close(); await hub.broadcast({'type':'users_updated'}); return {'ok':True}
 
 @app.delete('/api/users/{user_id}')
-async def delete_user(user_id:str):
+async def delete_user(user_id:str, _=Depends(require_admin)):
     c=conn()
     if not c.execute('SELECT 1 FROM users WHERE id=%s',(user_id,)).fetchone():
         c.close(); raise HTTPException(404,'Colaborador não encontrado.')
@@ -412,10 +487,12 @@ async def delete_user(user_id:str):
 
 @app.get('/api/users')
 def list_users():
-    c=conn(); rows=[dict(x) for x in c.execute('SELECT * FROM users WHERE ativo=1 ORDER BY nome')]; c.close(); return rows
+    # Aberto de propósito: a tela de login (admin e colaborador) precisa da
+    # lista de nomes antes de autenticar. Nunca inclui senha_hash/senha_salt.
+    c=conn(); rows=[dict(x) for x in c.execute(f'SELECT {USER_PUBLIC_COLS} FROM users WHERE ativo=1 ORDER BY nome')]; c.close(); return rows
 
 @app.put('/api/fulls/{full_id}/status')
-async def set_status(full_id:str, body:StatusIn):
+async def set_status(full_id:str, body:StatusIn, _=Depends(require_admin)):
     allowed={'aguardando','em_separacao','pronto','enviado'}
     if body.status not in allowed: raise HTTPException(400,'Status inválido.')
     c=conn(); f=c.execute('SELECT * FROM fulls WHERE id=%s',(full_id,)).fetchone()
@@ -427,7 +504,7 @@ async def set_status(full_id:str, body:StatusIn):
     t=now(); c.execute('UPDATE fulls SET status=%s,updated_at=%s WHERE id=%s',(body.status,t,full_id)); c.execute('INSERT INTO status_history VALUES (%s,%s,%s,%s,%s)',(uid('hist_'),full_id,body.status,body.user_id,t)); c.commit(); c.close(); await changed(full_id); return {'ok':True}
 
 @app.post('/api/fulls/{full_id}/collaborators')
-async def add_shipment_collaborator(full_id:str, body:ShipmentUserIn):
+async def add_shipment_collaborator(full_id:str, body:ShipmentUserIn, _=Depends(require_admin)):
     c=conn()
     if not c.execute('SELECT 1 FROM fulls WHERE id=%s',(full_id,)).fetchone(): raise HTTPException(404,'FULL não encontrado.')
     if not c.execute('SELECT 1 FROM users WHERE id=%s AND ativo=1',(body.user_id,)).fetchone(): raise HTTPException(404,'Colaborador não encontrado.')
@@ -438,11 +515,11 @@ async def add_shipment_collaborator(full_id:str, body:ShipmentUserIn):
     data=full_summary(c,full_id); c.close(); await hub.broadcast({'type':'full_updated','full_id':full_id,'data':data}); return data
 
 @app.delete('/api/fulls/{full_id}/collaborators/{user_id}')
-async def remove_shipment_collaborator(full_id:str,user_id:str):
+async def remove_shipment_collaborator(full_id:str,user_id:str, _=Depends(require_admin)):
     c=conn(); c.execute('DELETE FROM shipment_users WHERE full_id=%s AND user_id=%s',(full_id,user_id)); c.commit(); data=full_summary(c,full_id); c.close(); await hub.broadcast({'type':'full_updated','full_id':full_id,'data':data}); return data
 
 @app.get('/api/performance')
-def performance():
+def performance(_=Depends(require_admin_or_worker)):
     # Calculado sempre a partir do estado ATUAL do banco. Nada fica em cache.
     c=conn(); users=c.execute('SELECT * FROM users WHERE ativo=1 ORDER BY nome').fetchall(); out=[]
     for u in users:
@@ -473,7 +550,8 @@ def performance():
     c.close(); return out
 
 @app.post('/api/products/{product_id}/claim')
-async def claim_product(product_id:str, body:ClaimIn):
+async def claim_product(product_id:str, body:ClaimIn, current_user=Depends(require_worker)):
+    if current_user != body.user_id: raise HTTPException(403,'Você só pode assumir produtos em seu próprio nome.')
     c=conn()
     try:
         # Row-level lock: holds this product row until commit/rollback so two
@@ -498,7 +576,8 @@ async def claim_product(product_id:str, body:ClaimIn):
     data=full_summary(c,fid); c.close(); await hub.broadcast({'type':'full_updated','full_id':fid,'data':data}); return data
 
 @app.delete('/api/products/{product_id}/claim')
-async def release_product(product_id:str, user_id:str):
+async def release_product(product_id:str, user_id:str, current_user=Depends(require_worker)):
+    if current_user != user_id: raise HTTPException(403,'Você só pode liberar produtos em seu próprio nome.')
     c=conn()
     p=c.execute('SELECT * FROM products WHERE id=%s',(product_id,)).fetchone()
     if not p: raise HTTPException(404,'Produto não encontrado.')
@@ -513,7 +592,7 @@ async def release_product(product_id:str, user_id:str):
     c.commit(); fid=p['full_id']; c.close(); await changed(fid); return {'ok':True}
 
 @app.put('/api/products/{product_id}')
-async def edit_product(product_id:str, body:ProductEdit):
+async def edit_product(product_id:str, body:ProductEdit, _=Depends(require_admin)):
     c=conn()
     p=c.execute('SELECT * FROM products WHERE id=%s',(product_id,)).fetchone()
     if not p: c.close(); raise HTTPException(404,'Produto não encontrado.')
@@ -540,7 +619,7 @@ async def edit_product(product_id:str, body:ProductEdit):
     c.commit(); fid=p['full_id']; c.close(); await changed(fid); return {'ok':True}
 
 @app.delete('/api/products/{product_id}')
-async def delete_product(product_id:str):
+async def delete_product(product_id:str, _=Depends(require_admin)):
     c=conn()
     p=c.execute('SELECT * FROM products WHERE id=%s',(product_id,)).fetchone()
     if not p: c.close(); raise HTTPException(404,'Produto não encontrado.')
@@ -549,7 +628,7 @@ async def delete_product(product_id:str):
     c.commit(); c.close(); await changed(fid); return {'ok':True}
 
 @app.post('/api/fulls/{full_id}/assignments')
-async def save_assignment(full_id:str, body:AssignmentIn):
+async def save_assignment(full_id:str, body:AssignmentIn, _=Depends(require_admin)):
     c=conn();
     p=c.execute('SELECT * FROM products WHERE id=%s AND full_id=%s',(body.product_id,full_id)).fetchone()
     u=c.execute('SELECT * FROM users WHERE id=%s AND ativo=1',(body.user_id,)).fetchone()
@@ -568,9 +647,10 @@ async def save_assignment(full_id:str, body:AssignmentIn):
     c.commit(); c.close(); await changed(full_id); return {'ok':True}
 
 @app.put('/api/assignments/{assignment_id}/progress')
-async def progress(assignment_id:str, body:ProgressIn):
+async def progress(assignment_id:str, body:ProgressIn, current_user=Depends(require_worker)):
     c=conn(); a=c.execute('SELECT a.*,p.quantidade product_total FROM assignments a JOIN products p ON p.id=a.product_id WHERE a.id=%s',(assignment_id,)).fetchone()
     if not a: raise HTTPException(404,'Tarefa não encontrada.')
+    if a['user_id'] != current_user: c.close(); raise HTTPException(403,'Você só pode atualizar o progresso das suas próprias tarefas.')
     p=c.execute('SELECT claimed_by FROM products WHERE id=%s',(a['product_id'],)).fetchone()
     if p and p['claimed_by'] and p['claimed_by'] != a['user_id']: raise HTTPException(409,'Esta tarefa foi assumida por outro colaborador.')
     max_allowed=a['quantidade']; val=min(body.separado,max_allowed)
@@ -578,20 +658,20 @@ async def progress(assignment_id:str, body:ProgressIn):
     c.commit(); fid=a['full_id']; c.close(); await changed(fid); return {'ok':True}
 
 @app.post('/api/fulls/{full_id}/volumes')
-async def create_volume(full_id:str, body:VolumeCreate):
+async def create_volume(full_id:str, body:VolumeCreate, _=Depends(require_admin_or_worker)):
     c=conn();
     if not c.execute('SELECT 1 FROM fulls WHERE id=%s',(full_id,)).fetchone(): raise HTTPException(404,'FULL não encontrado.')
     seq=c.execute('SELECT COALESCE(MAX(seq),0)+1 n FROM volumes WHERE full_id=%s',(full_id,)).fetchone()['n']; t=now(); vid=uid('vol_')
     c.execute('INSERT INTO volumes VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',(vid,full_id,seq,'mista','aberta',body.created_by,t,t)); c.commit(); c.close(); await changed(full_id); return {'id':vid,'seq':seq}
 
 @app.delete('/api/volumes/{volume_id}')
-async def delete_volume(volume_id:str):
+async def delete_volume(volume_id:str, _=Depends(require_admin_or_worker)):
     c=conn(); v=c.execute('SELECT * FROM volumes WHERE id=%s',(volume_id,)).fetchone()
     if not v: raise HTTPException(404,'Volume não encontrado.')
     c.execute('DELETE FROM volumes WHERE id=%s',(volume_id,)); c.commit(); fid=v['full_id']; c.close(); await changed(fid); return {'ok':True}
 
 @app.post('/api/volumes/{volume_id}/items')
-async def add_volume_item(volume_id:str, body:VolumeItemIn):
+async def add_volume_item(volume_id:str, body:VolumeItemIn, _=Depends(require_admin_or_worker)):
     c=conn(); v=c.execute('SELECT * FROM volumes WHERE id=%s',(volume_id,)).fetchone();
     if not v: raise HTTPException(404,'Volume não encontrado.')
     if v['status']=='fechada': raise HTTPException(400,'Volume fechado não pode ser alterado.')
@@ -612,14 +692,14 @@ async def add_volume_item(volume_id:str, body:VolumeItemIn):
     c.execute('UPDATE volumes SET updated_at=%s WHERE id=%s',(t,volume_id)); c.commit(); fid=v['full_id']; c.close(); await changed(fid); return {'ok':True}
 
 @app.delete('/api/volume-items/{item_id}')
-async def delete_volume_item(item_id:str):
+async def delete_volume_item(item_id:str, _=Depends(require_admin_or_worker)):
     c=conn(); x=c.execute('SELECT vi.*,v.full_id,v.status FROM volume_items vi JOIN volumes v ON v.id=vi.volume_id WHERE vi.id=%s',(item_id,)).fetchone()
     if not x: raise HTTPException(404,'Item não encontrado.')
     if x['status']=='fechada': raise HTTPException(400,'Volume fechado não pode ser alterado.')
     c.execute('DELETE FROM volume_items WHERE id=%s',(item_id,)); c.commit(); fid=x['full_id']; c.close(); await changed(fid); return {'ok':True}
 
 @app.put('/api/volumes/{volume_id}/status')
-async def volume_status(volume_id:str):
+async def volume_status(volume_id:str, _=Depends(require_admin_or_worker)):
     c=conn(); v=c.execute('SELECT * FROM volumes WHERE id=%s',(volume_id,)).fetchone()
     if not v: raise HTTPException(404,'Volume não encontrado.')
     n=c.execute('SELECT COUNT(*) n FROM volume_items WHERE volume_id=%s',(volume_id,)).fetchone()['n']
@@ -627,7 +707,7 @@ async def volume_status(volume_id:str):
     c.execute('UPDATE volumes SET status=CASE WHEN status=\'aberta\' THEN \'fechada\' ELSE \'aberta\' END,updated_at=%s WHERE id=%s',(now(),volume_id)); c.commit(); fid=v['full_id']; c.close(); await changed(fid); return {'ok':True}
 
 @app.get('/api/fulls/{full_id}/history')
-def history(full_id:str):
+def history(full_id:str, _=Depends(require_admin_or_worker)):
     c=conn(); rows=[dict(x) for x in c.execute('SELECT h.*,u.nome user_nome FROM status_history h LEFT JOIN users u ON u.id=h.user_id WHERE h.full_id=%s ORDER BY h.created_at',(full_id,))]; c.close(); return rows
 
 @app.websocket('/ws')
