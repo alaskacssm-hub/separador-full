@@ -5,6 +5,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 import json, os, re, uuid, asyncio
 from datetime import datetime, date
 from pathlib import Path
@@ -44,9 +45,37 @@ class Hub:
 
 hub=Hub()
 
+# Pool de conexões: evita abrir um handshake TCP+TLS novo com o Postgres a cada
+# requisição (o maior custo de latência num banco remoto como o Neon). min_size=0
+# porque bancos free-tier "dormem" quando ociosos — não faz sentido manter
+# conexões abertas o tempo todo; check_connection descarta conexões mortas
+# (ex.: depois do Neon hibernar) e abre uma nova automaticamente, sem precisar
+# reiniciar o app.
+POOL = ConnectionPool(
+    DATABASE_URL,
+    min_size=0,
+    max_size=5,
+    kwargs={'row_factory': dict_row, 'autocommit': False},
+    check=ConnectionPool.check_connection,
+    open=True,
+)
+
+class _PooledConn:
+    """Se comporta como uma conexão psycopg normal, mas .close() devolve a
+    conexão pro pool em vez de derrubá-la de verdade. Sempre dá rollback antes
+    de devolver: garante que nenhuma transação/trava fique pendurada de um
+    request pro próximo (ex.: rotas que fecham a conexão cedo, num erro 404,
+    sem ter chamado commit/rollback explicitamente)."""
+    def __init__(self, raw): object.__setattr__(self, '_raw', raw)
+    def __getattr__(self, name): return getattr(object.__getattribute__(self, '_raw'), name)
+    def close(self):
+        raw = object.__getattribute__(self, '_raw')
+        try: raw.rollback()
+        except Exception: pass
+        POOL.putconn(raw)
+
 def conn():
-    c=psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=False)
-    return c
+    return _PooledConn(POOL.getconn())
 
 def init_db():
     c=conn()
