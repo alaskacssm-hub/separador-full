@@ -250,6 +250,16 @@ def list_fulls():
 def get_full(full_id:str):
     c=conn(); d=full_summary(c,full_id); c.commit(); c.close(); return d
 
+@app.delete('/api/fulls/{full_id}')
+async def delete_full(full_id:str):
+    c=conn()
+    if not c.execute('SELECT 1 FROM fulls WHERE id=%s',(full_id,)).fetchone():
+        c.close(); raise HTTPException(404,'FULL não encontrado.')
+    c.execute('DELETE FROM fulls WHERE id=%s',(full_id,))  # cascade remove produtos, atribuições, volumes e histórico
+    c.commit(); c.close()
+    await hub.broadcast({'type':'full_deleted','full_id':full_id})
+    return {'ok':True}
+
 @app.post('/api/users')
 async def create_user(body:UserCreate):
     name=body.nome.strip()
@@ -260,6 +270,21 @@ async def create_user(body:UserCreate):
     except psycopg.errors.UniqueViolation:
         c.rollback(); c.close(); raise HTTPException(409,'Colaborador já cadastrado.')
     rows=[dict(x) for x in c.execute('SELECT * FROM users WHERE ativo=1 ORDER BY nome')]; c.close(); await hub.broadcast({'type':'users_updated'}); return rows
+
+@app.delete('/api/users/{user_id}')
+async def delete_user(user_id:str):
+    c=conn()
+    if not c.execute('SELECT 1 FROM users WHERE id=%s',(user_id,)).fetchone():
+        c.close(); raise HTTPException(404,'Colaborador não encontrado.')
+    # Desativa em vez de apagar de vez: preserva o histórico de desempenho e não
+    # quebra registros antigos (atribuições, caixas, histórico de status) que
+    # apontam para este colaborador.
+    c.execute('UPDATE users SET ativo=0 WHERE id=%s',(user_id,))
+    c.execute('DELETE FROM shipment_users WHERE user_id=%s',(user_id,))
+    c.execute('UPDATE products SET claimed_by=NULL,claimed_at=NULL WHERE claimed_by=%s',(user_id,))
+    c.commit(); c.close()
+    await hub.broadcast({'type':'users_updated'})
+    return {'ok':True}
 
 @app.get('/api/users')
 def list_users():
