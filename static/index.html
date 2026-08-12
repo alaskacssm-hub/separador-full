@@ -219,7 +219,7 @@ async function api(u,o={}){let h={...(o.headers||{})};if(!(o.body instanceof For
 function badge(s){return `<span class="badge ${s}">${({aguardando:'Aguardando',em_separacao:'Em separação',pronto:'Pronto',enviado:'Enviado'})[s]||s}</span>`}
 function goMode(m){location.href='/?mode='+m}
 function shell(body){return `<div class="desktop"><aside class="side"><div class="brand">FULL <span>CONTROL</span></div><div class="nav"><button class="${S.view==='admin'?'active':''}" onclick="adminHome()">📊 Dashboard</button><button class="${S.view==='adminShip'?'active':''}" onclick="adminShipments()">📦 Envios</button><button class="${S.view==='adminUsers'?'active':''}" onclick="adminUsers()">👥 Colaboradores</button><button class="${S.view==='adminPerf'?'active':''}" onclick="adminPerf()">🏆 Desempenho</button><button onclick="goMode('worker')">📱 Área do colaborador</button></div><div style="position:absolute;bottom:20px;color:#94a3b8;font-size:11px">● tempo real</div></aside><main class="main">${body}</main></div><div class="mobilebar"><button class="${S.view==='admin'?'active':''}" onclick="adminHome()">📊<br>Dashboard</button><button class="${S.view==='adminShip'?'active':''}" onclick="adminShipments()">📦<br>Envios</button><button class="${S.view==='adminUsers'?'active':''}" onclick="adminUsers()">👥<br>Equipe</button><button class="${S.view==='adminPerf'?'active':''}" onclick="adminPerf()">🏆<br>Desempenho</button><button onclick="goMode('worker')">📱<br>Separar</button></div>`}
-function render(){if(S.mode==='home'){home();return}if(S.mode==='worker'){workerRender();return}document.querySelector('#app').innerHTML=shell(S.view==='admin'?adminDashboard():S.view==='adminShip'?adminShipmentPage():S.view==='adminUsers'?adminUsersPage():S.view==='adminPerf'?adminPerformancePage():adminFullPage())}
+function render(){let sy=window.scrollY;if(S.mode==='home'){home();return}if(S.mode==='worker'){workerRender();window.scrollTo(0,sy);return}document.querySelector('#app').innerHTML=shell(S.view==='admin'?adminDashboard():S.view==='adminShip'?adminShipmentPage():S.view==='adminUsers'?adminUsersPage():S.view==='adminPerf'?adminPerformancePage():adminFullPage());window.scrollTo(0,sy)}
 function adminLoginScreen(){document.querySelector('#app').innerHTML=`<div class="home"><div class="homebox"><div class="card" style="max-width:420px;margin:0 auto"><div class="title">Área administrativa</div><div class="sub">Digite a senha de administrador.</div><div class="field" style="margin-top:16px"><label>Senha</label><input id="adminPass" type="password" placeholder="Senha" onkeydown="if(event.key==='Enter')doAdminLogin()"></div><div id="adminErr" class="small err" style="margin-top:6px"></div><button class="btn primary block" style="margin-top:14px" onclick="doAdminLogin()">Entrar</button><button class="btn block" style="margin-top:8px" onclick="goMode('home')">Voltar</button></div></div></div>`;$('#adminPass')?.focus()}
 async function doAdminLogin(){let senha=$('#adminPass').value;if(!senha)return;try{let d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({senha})});S.adminToken=d.token||'';if(d.token)localStorage.setItem('full_admin_token',d.token);S.view='admin';await loadAll();render()}catch(e){$('#adminErr').textContent=e.message}}
 async function adminGate(){try{let chk=await api('/api/admin/check');if(chk.protegido&&!chk.autenticado){adminLoginScreen();return}S.view='admin';await loadAll();render()}catch(e){adminLoginScreen()}}
@@ -308,7 +308,66 @@ function addItem(vid){let opts=S.full.products.map(p=>{let used=S.full.volumes.r
 async function saveItem(vid){try{let q=Number($('#vq').value||0);if(q<1)return alert('Informe uma quantidade.');await api('/api/volumes/'+vid+'/items',{method:'POST',body:JSON.stringify({product_id:$('#vp').value,quantidade:q,modo:'definir'})});closeM();S.full=await api('/api/fulls/'+S.full.full.id);render()}catch(e){alert(e.message)}}
 async function toggleVol(id){try{await api('/api/volumes/'+id+'/status',{method:'PUT'});S.full=await api('/api/fulls/'+S.full.full.id);render()}catch(e){alert(e.message)}}
 async function loadHistory(){S.hist=await api('/api/fulls/'+S.full.full.id+'/history');S.tab='history';render()}
-function ws(){let p=location.protocol==='https:'?'wss':'ws',w=new WebSocket(p+'://'+location.host+'/ws');w.onopen=()=>w.send('hello');w.onmessage=async e=>{let m=JSON.parse(e.data);if(m.type==='full_updated'){if(S.full?.full.id===m.full_id)S.full=m.data;if(S.mode==='admin')await loadAll();if(S.mode==='worker'&&S.full?.full.id===m.full_id)renderWorkerProducts();render()}if(m.type==='full_created'||m.type==='users_updated')await loadAll();if(m.type==='users_updated'&&S.mode==='worker')workerRender()};w.onclose=()=>setTimeout(ws,1500)}
+// ---------- atualização em tempo real sem atrapalhar quem está digitando ----------
+// Antes de qualquer atualização vinda de outro usuário, guardamos o valor de todo
+// campo em tela (por id) e o que está focado; depois de re-renderizar, devolvemos
+// esses valores para os elementos de mesmo id. Assim ninguém perde o que estava
+// digitando (ex.: quantidade da conferência) só porque outra pessoa mexeu em algo.
+function captureFormState(){
+    let st={scrollY:window.scrollY,fields:{},focusId:(document.activeElement&&document.activeElement.id)||null};
+    document.querySelectorAll('#app input[id],#app select[id],#app textarea[id]').forEach(el=>{st.fields[el.id]=el.value});
+    if(st.focusId){let el=document.getElementById(st.focusId);if(el&&typeof el.selectionStart==='number'){st.selStart=el.selectionStart;st.selEnd=el.selectionEnd}}
+    return st
+}
+function restoreFormState(st){
+    Object.keys(st.fields).forEach(id=>{let el=document.getElementById(id);if(el)el.value=st.fields[id]});
+    if(st.focusId){let el=document.getElementById(st.focusId);if(el){el.focus();if(typeof st.selStart==='number'&&el.setSelectionRange){try{el.setSelectionRange(st.selStart,st.selEnd)}catch(_){}}}}
+    window.scrollTo(0,st.scrollY)
+}
+function liveRender(){let st=captureFormState();render();restoreFormState(st)}
+function liveWorkerRender(){let st=captureFormState();renderWorkerProducts();restoreFormState(st)}
+
+// Agrupa várias notificações que chegam em rajada (ex.: várias caixas fechadas
+// em sequência) numa única atualização, e só busca de novo o que realmente
+// está sendo exibido na tela desta pessoa no momento — outras telas ficam em
+// paz até a pessoa navegar até elas (quando os dados já são buscados na hora).
+let _wsTimer=null,_wsNeeds={fulls:false,users:false,performance:false,worklist:false};
+function wsMark(flags){flags.forEach(f=>_wsNeeds[f]=true);clearTimeout(_wsTimer);_wsTimer=setTimeout(wsFlush,300)}
+async function wsFlush(){
+    let n=_wsNeeds;_wsNeeds={fulls:false,users:false,performance:false,worklist:false};
+    try{
+        if(n.fulls)S.fulls=await api('/api/fulls');
+        if(n.users)S.users=await api('/api/users');
+        if(n.performance&&S.view==='adminPerf')S.performance=await api('/api/performance');
+    }catch(e){return} // instabilidade passageira: tenta de novo no próximo evento
+    if(S.mode==='worker'){
+        if(n.worklist&&!S.full)await loadWorkerShipments();
+        else if(S.full)liveWorkerRender();else liveRender()
+    }else liveRender()
+}
+function ws(){
+    let p=location.protocol==='https:'?'wss':'ws',w=new WebSocket(p+'://'+location.host+'/ws');
+    w.onopen=()=>w.send('hello');
+    w.onmessage=e=>{
+        let m=JSON.parse(e.data);
+        if(m.type==='full_updated'){
+            let openHere=S.full&&S.full.full.id===m.full_id;
+            if(openHere)S.full=m.data; // já veio no evento, não precisa buscar de novo
+            let onList=S.mode==='admin'&&(S.view==='admin'||S.view==='adminShip');
+            let onPerf=S.mode==='admin'&&S.view==='adminPerf';
+            let onWorkerList=S.mode==='worker'&&!S.full;
+            if(!openHere&&!onList&&!onPerf&&!onWorkerList)return; // não é da conta desta tela agora
+            let flags=[];if(onList)flags.push('fulls');if(onPerf)flags.push('performance');if(onWorkerList)flags.push('worklist');
+            wsMark(flags)
+        }else if(m.type==='full_created'){
+            if(S.mode==='admin'&&(S.view==='admin'||S.view==='adminShip'))wsMark(['fulls']);
+            else if(S.mode==='worker'&&!S.full)wsMark(['worklist'])
+        }else if(m.type==='users_updated'){
+            if((S.mode==='admin'&&S.view==='adminUsers')||(S.mode==='worker'&&(!S.me||!S.workerToken)))wsMark(['users'])
+        }
+    };
+    w.onclose=()=>setTimeout(ws,1500)
+}
 (async()=>{try{S.users=await api('/api/users');if(S.mode==='admin'){await adminGate()}else if(S.mode==='worker'){workerRender()}else{home()}ws()}catch(e){document.querySelector('#app').innerHTML='<div class="empty">Erro ao carregar sistema: '+esc(e.message)+'</div>'}})();
 </script>
 </body></html>
