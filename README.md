@@ -57,6 +57,14 @@ Acesse `http://localhost:8000`. As tabelas são criadas automaticamente no prime
 
 > Não abra `static/index.html` diretamente — o front-end depende da API do backend.
 
+### 4. Senhas (autenticação)
+- **Colaboradores**: cada um tem senha própria, definida pelo admin ao cadastrar (ou depois,
+  em Colaboradores → 🔑 Definir/Redefinir senha). Sem senha definida, o colaborador não
+  consegue entrar na área de separação.
+- **Painel administrativo**: opcional. Defina `ADMIN_PASSWORD` no `.env` (ou nas variáveis de
+  ambiente do Render) para exigir login antes de acessar `/?mode=admin`. Se não for definida,
+  o painel administrativo fica aberto (como nas versões anteriores).
+
 ---
 
 ## Colocando no GitHub

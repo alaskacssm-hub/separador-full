@@ -229,6 +229,11 @@ def init_db():
     # Migrations for databases created by older versions of this app.
     c.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS claimed_by TEXT')
     c.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS claimed_at TEXT')
+    # Conferência pós-envio: quantidade que o Mercado Livre efetivamente
+    # conferiu ao receber o envio. Fica NULL até o admin registrar o resultado.
+    c.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS conferido INTEGER')
+    c.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS conferencia_obs TEXT')
+    c.execute('ALTER TABLE products ADD COLUMN IF NOT EXISTS conferencia_at TEXT')
     # Senha individual por colaborador. Colaboradores criados antes desta versão
     # ficam com senha_hash NULL, ou seja, sem senha definida ainda — o admin
     # precisa definir uma para cada um antes que eles consigam entrar.
@@ -315,15 +320,20 @@ def full_summary(c, full_id):
         assigned=claimed['quantidade'] if claimed else 0
         separated=claimed['separado'] if claimed else 0
         boxed=sum(x['quantidade'] for x in vitems if x['product_id']==p['id'])
-        p_rows.append(dict(p)|{'atribuido':assigned,'separado':separated,'em_volumes':boxed,'saldo_separar':p['quantidade']-separated,'saldo_volume':p['quantidade']-boxed,'disponivel':not bool(p['claimed_by']),'claimed_by':p['claimed_by'],'claimed_user_nome':(claimed['user_nome'] if claimed else None)})
+        conferido=p['conferido']
+        diferenca = (conferido - p['quantidade']) if conferido is not None else None
+        status_conf = None if conferido is None else ('falta' if diferenca<0 else ('sobra' if diferenca>0 else 'ok'))
+        p_rows.append(dict(p)|{'atribuido':assigned,'separado':separated,'em_volumes':boxed,'saldo_separar':p['quantidade']-separated,'saldo_volume':p['quantidade']-boxed,'disponivel':not bool(p['claimed_by']),'claimed_by':p['claimed_by'],'claimed_user_nome':(claimed['user_nome'] if claimed else None),'diferenca_conferencia':diferenca,'status_conferencia':status_conf})
     total=sum(p['quantidade'] for p in p_rows); sep=sum(p['separado'] for p in p_rows); boxed=sum(p['em_volumes'] for p in p_rows)
+    conferidos=[p for p in p_rows if p['conferido'] is not None]
+    divergentes=[p for p in conferidos if p['status_conferencia']!='ok']
     vols_out=[]
     for v in vols:
         items=[dict(x) for x in vitems if x['volume_id']==v['id']]
         tipo='vazia' if not items else ('unica' if len(items)==1 else 'mista')
         if v['tipo']!=tipo: c.execute('UPDATE volumes SET tipo=%s,updated_at=%s WHERE id=%s',(tipo,now(),v['id']))
         vols_out.append(dict(v)|{'tipo':tipo,'items':items,'total_unidades':sum(x['quantidade'] for x in items)})
-    return {'full':dict(f),'products':p_rows,'users':[dict(u) for u in users],'shipment_users':[dict(u) for u in shipment_users],'assignments':[dict(a) for a in assigns],'volumes':vols_out,'stats':{'produtos':len(p_rows),'unidades':total,'separado':sep,'em_volumes':boxed,'progresso':round((sep/total*100) if total else 0,1),'volumes':len(vols_out)}}
+    return {'full':dict(f),'products':p_rows,'users':[dict(u) for u in users],'shipment_users':[dict(u) for u in shipment_users],'assignments':[dict(a) for a in assigns],'volumes':vols_out,'stats':{'produtos':len(p_rows),'unidades':total,'separado':sep,'em_volumes':boxed,'progresso':round((sep/total*100) if total else 0,1),'volumes':len(vols_out),'produtos_conferidos':len(conferidos),'produtos_divergentes':len(divergentes),'unidades_falta':sum(-p['diferenca_conferencia'] for p in divergentes if p['diferenca_conferencia']<0),'unidades_sobra':sum(p['diferenca_conferencia'] for p in divergentes if p['diferenca_conferencia']>0)}}
 
 async def changed(full_id):
     c=conn(); data=full_summary(c,full_id); c.commit(); c.close(); await hub.broadcast({'type':'full_updated','full_id':full_id,'data':data})
@@ -344,6 +354,7 @@ class ProgressIn(BaseModel): separado: int=Field(ge=0)
 class StatusIn(BaseModel): status: str; user_id: str|None=None
 class VolumeCreate(BaseModel): created_by: str|None=None
 class VolumeItemIn(BaseModel): product_id: str; quantidade: int=Field(ge=0); modo: str='somar'
+class ConferenciaIn(BaseModel): conferido: int|None = Field(default=None, ge=0); obs: str|None = None
 class ProductEdit(BaseModel):
     nome: str|None = None
     quantidade: int|None = Field(default=None, ge=0)
@@ -523,7 +534,7 @@ def performance(_=Depends(require_admin_or_worker)):
     # Calculado sempre a partir do estado ATUAL do banco. Nada fica em cache.
     c=conn(); users=c.execute('SELECT * FROM users WHERE ativo=1 ORDER BY nome').fetchall(); out=[]
     for u in users:
-        rows=c.execute("""SELECT a.*,f.nome full_nome,p.nome product_nome
+        rows=c.execute("""SELECT a.*,f.nome full_nome,p.nome product_nome,p.sku,p.codigo_ml,p.quantidade product_quantidade,p.conferido,p.conferencia_obs
                           FROM assignments a
                           JOIN fulls f ON f.id=a.full_id
                           JOIN products p ON p.id=a.product_id
@@ -538,6 +549,16 @@ def performance(_=Depends(require_admin_or_worker)):
                                       WHERE v.full_id=%s AND vi.product_id=%s""",(r['full_id'],r['product_id'])).fetchone()['n'] or 0)
         sep_pct=round(sep/assigned*100,1) if assigned else 0
         box_pct=round(boxed/assigned*100,1) if assigned else 0
+        conferidos=[r for r in rows if r['conferido'] is not None]
+        divergencias=[]
+        falta=sobra=0
+        for r in conferidos:
+            diff=int(r['conferido'])-int(r['product_quantidade'] or 0)
+            if diff!=0:
+                divergencias.append({'full_id':r['full_id'],'full_nome':r['full_nome'],'product_id':r['product_id'],'product_nome':r['product_nome'],'sku':r['sku'],'esperado':r['product_quantidade'],'conferido':r['conferido'],'diferenca':diff,'obs':r['conferencia_obs']})
+                if diff<0: falta+=-diff
+                else: sobra+=diff
+        taxa_acerto=round((len(conferidos)-len(divergencias))/len(conferidos)*100,1) if conferidos else None
         out.append({
             'user_id':u['id'],'nome':u['nome'],
             'envios':len(set(r['full_id'] for r in rows)),
@@ -545,7 +566,9 @@ def performance(_=Depends(require_admin_or_worker)):
             'em_volumes':boxed,'progresso':sep_pct,
             'progresso_volumes':box_pct,
             'progresso_operacional':min(sep_pct,box_pct),
-            'concluidos':sum(1 for r in rows if int(r['separado'] or 0)>=int(r['quantidade'] or 0))
+            'concluidos':sum(1 for r in rows if int(r['separado'] or 0)>=int(r['quantidade'] or 0)),
+            'produtos_conferidos':len(conferidos),'divergencias':divergencias,
+            'unidades_falta':falta,'unidades_sobra':sobra,'taxa_acerto':taxa_acerto
         })
     c.close(); return out
 
@@ -589,6 +612,17 @@ async def release_product(product_id:str, user_id:str, current_user=Depends(requ
     remaining_tasks=c.execute('SELECT COUNT(*) n FROM assignments WHERE full_id=%s',(p['full_id'],)).fetchone()['n']
     if remaining_tasks==0:
         c.execute("UPDATE fulls SET status='aguardando',updated_at=%s WHERE id=%s",(now(),p['full_id']))
+    c.commit(); fid=p['full_id']; c.close(); await changed(fid); return {'ok':True}
+
+@app.put('/api/products/{product_id}/conferencia')
+async def set_conferencia(product_id:str, body:ConferenciaIn, _=Depends(require_admin)):
+    c=conn()
+    p=c.execute('SELECT * FROM products WHERE id=%s',(product_id,)).fetchone()
+    if not p: c.close(); raise HTTPException(404,'Produto não encontrado.')
+    if body.conferido is None:
+        c.execute('UPDATE products SET conferido=NULL,conferencia_obs=NULL,conferencia_at=NULL WHERE id=%s',(product_id,))
+    else:
+        c.execute('UPDATE products SET conferido=%s,conferencia_obs=%s,conferencia_at=%s WHERE id=%s',(body.conferido,(body.obs or '').strip() or None,now(),product_id))
     c.commit(); fid=p['full_id']; c.close(); await changed(fid); return {'ok':True}
 
 @app.put('/api/products/{product_id}')
